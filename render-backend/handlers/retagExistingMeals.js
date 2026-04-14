@@ -1,5 +1,6 @@
 const admin = require("firebase-admin");
-const { MEALS_COLLECTION, tagMealWithGemini } = require("../meal_tagger");
+const { MEALS_COLLECTION } = require("../meal_tagger");
+const { getMealTaggingService } = require("../tagging/meal_tagging_service");
 
 /**
  * Retags existing meals in bulk using Gemini AI.
@@ -11,7 +12,7 @@ async function retagExistingMealsHandler(request, { HttpsError }) {
   }
 
   const db = admin.firestore();
-  const apiKey = process.env.GEMINI_API_KEY;
+  const taggingService = getMealTaggingService();
 
   const requestedBatchSize = Number(request.data?.batchSize);
   const batchSize =
@@ -31,32 +32,40 @@ async function retagExistingMealsHandler(request, { HttpsError }) {
 
   const results = [];
   let taggedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
 
   for (const doc of docsToTag) {
-    const tagData = await tagMealWithGemini({
-      mealId: doc.id,
-      mealData: doc.data(),
-      apiKey,
-      admin,
-      log: console,
-    });
+    try {
+      const result = await taggingService.enqueueAndWait({
+        mealId: doc.id,
+        reason: "bulk-retag",
+        priority: 1,
+        force: forceRetag,
+      });
 
-    // Clear autoTagError on success, keep it on failure
-    if (tagData.autoTagged === true) {
-      tagData.autoTagError = admin.firestore.FieldValue.delete();
+      results.push({
+        id: doc.id,
+        status: result.status,
+        source: result.source || null,
+        fallbackUsed: result.fallbackUsed === true,
+        tags: result.tags || [],
+      });
+
+      if (result.status === "skipped" || result.status === "cached") {
+        skippedCount++;
+      } else if (result.status === "processed") {
+        taggedCount++;
+      }
+    } catch (error) {
+      failedCount++;
+      results.push({
+        id: doc.id,
+        status: "failed",
+        error: error.message,
+      });
+      console.error(`[retagExistingMealsHandler] Error for ${doc.id}:`, error);
     }
-
-    await doc.ref.update(tagData);
-    results.push({
-      id: doc.id,
-      tags: tagData.tags,
-      autoTagged: tagData.autoTagged === true,
-      error: tagData.autoTagError || null,
-    });
-
-    if (tagData.autoTagged === true) taggedCount++;
-
-    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
   // Fallback: manually tag known failed meals
@@ -91,7 +100,12 @@ async function retagExistingMealsHandler(request, { HttpsError }) {
     }
   }
 
-  return { tagged: taggedCount, results };
+  return {
+    tagged: taggedCount,
+    skipped: skippedCount,
+    failed: failedCount,
+    results,
+  };
 }
 
 module.exports = { retagExistingMealsHandler };

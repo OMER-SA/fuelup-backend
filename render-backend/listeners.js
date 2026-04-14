@@ -3,8 +3,8 @@ const {
   hasMealContent,
   getMealName,
   getComparableIngredientSignature,
-  tagMealWithGemini,
 } = require("./meal_tagger");
+const { getMealTaggingService } = require("./tagging/meal_tagging_service");
 
 /**
  * Starts all real-time listeners that replace Firebase background triggers.
@@ -13,7 +13,7 @@ const {
 function startListeners(admin) {
   const db = admin.firestore();
   const rtdb = admin.database();
-  const apiKey = process.env.GEMINI_API_KEY;
+  const taggingService = getMealTaggingService();
 
   // ── 1. onOrderStatusChanged (was: RTDB onValueUpdated) ───────────────────
   // Listens to every order's status field in Realtime Database.
@@ -132,25 +132,12 @@ function startListeners(admin) {
             continue;
           }
 
-          try {
-            const tagData = await tagMealWithGemini({
-              mealId,
-              mealData,
-              apiKey,
-              admin,
-              log: console,
-            });
-
-            await doc.ref.update(tagData);
-
-            if (tagData.autoTagged) {
-              console.info(`[autoTagMeal] Tagged: ${getMealName(mealData)} -> ${tagData.tags.join(", ")}`);
-            } else {
-              console.warn(`[autoTagMeal] Failed for ${getMealName(mealData)}: ${tagData.autoTagError}`);
-            }
-          } catch (err) {
-            console.error(`[autoTagMeal] Error for ${mealId}:`, err);
-          }
+          taggingService.enqueue({
+            mealId,
+            reason: "new-meal",
+            priority: 5,
+          });
+          console.info(`[autoTagMeal] Queued tagging for ${getMealName(mealData)}`);
         }
 
         // ── reTagOnIngredientUpdate (modified document) ─────────────────────
@@ -166,25 +153,18 @@ function startListeners(admin) {
 
           console.info(`[reTagOnIngredientUpdate] Ingredients changed for ${getMealName(mealData)}, re-tagging...`);
 
-          try {
-            const tagData = await tagMealWithGemini({
-              mealId,
-              mealData,
-              apiKey,
-              admin,
-              log: console,
-            });
-
-            await doc.ref.update(tagData);
-            console.info(`[reTagOnIngredientUpdate] Re-tagged: ${getMealName(mealData)}`);
-          } catch (err) {
-            console.error(`[reTagOnIngredientUpdate] Error for ${mealId}:`, err);
-          }
+          taggingService.enqueue({
+            mealId,
+            reason: "ingredient-update",
+            priority: 10,
+          });
+          console.info(`[reTagOnIngredientUpdate] Queued retag for ${getMealName(mealData)}`);
         }
 
         // Clean up cache for deleted meals
         if (change.type === "removed") {
           mealCache.delete(mealId);
+          taggingService.forget(mealId);
         }
       }
     },

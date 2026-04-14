@@ -24,10 +24,10 @@ fuelup-backend/
 | Original Firebase Function    | Replacement                          |
 |-------------------------------|--------------------------------------|
 | `onOrderStatusChanged` (RTDB) | `listeners.js` — RTDB onSnapshot     |
-| `notifyChef` (callable)       | `POST /notifyChef`                   |
-| `autoTagMeal` (Firestore)     | `listeners.js` — Firestore onSnapshot|
-| `reTagOnIngredientUpdate`     | `listeners.js` — Firestore onSnapshot|
-| `retagExistingMeals` (callable)| `POST /retagExistingMeals`          |
+| `notifyChef`                 | `POST /notifyChef`                    |
+| `autoTagMeal`                | `listeners.js` — Firestore onSnapshot|
+| `reTagOnIngredientUpdate`    | `listeners.js` — Firestore onSnapshot|
+| `retagExistingMeals`         | `POST /retagExistingMeals`           |
 
 ---
 
@@ -112,36 +112,30 @@ In your Flutter app, replace Firebase callable function calls with HTTP calls to
 
 **Before (Firebase):**
 ```dart
-final callable = FirebaseFunctions.instance.httpsCallable('notifyChef');
-await callable.call({'chefId': id, 'title': title, 'body': body});
-```
-
-**After (Render):**
-```dart
-final callable = FirebaseFunctions.instance.httpsCallableFromUrl(
-  'https://fuelup-backend.onrender.com/notifyChef',
+final response = await http.post(
+  Uri.parse('https://fuelup-backend.onrender.com/notifyChef'),
+  headers: {'Content-Type': 'application/json'},
+  body: jsonEncode({
+    'data': {'chefId': id, 'title': title, 'body': body},
+  }),
 );
-await callable.call({'chefId': id, 'title': title, 'body': body});
 ```
 
 ### retagExistingMeals
 
 **Before (Firebase):**
 ```dart
-final callable = FirebaseFunctions.instance.httpsCallable('retagExistingMeals');
-await callable.call({'batchSize': 20, 'forceRetag': false});
-```
-
-**After (Render):**
-```dart
-final callable = FirebaseFunctions.instance.httpsCallableFromUrl(
-  'https://fuelup-backend.onrender.com/retagExistingMeals',
+final response = await http.post(
+  Uri.parse('https://fuelup-backend.onrender.com/retagExistingMeals'),
+  headers: {'Content-Type': 'application/json'},
+  body: jsonEncode({
+    'data': {'batchSize': 20, 'forceRetag': false},
+  }),
 );
-await callable.call({'batchSize': 20, 'forceRetag': false});
 ```
 
-> The Firebase Flutter SDK's `httpsCallableFromUrl` sends the exact same
-> `{ "data": {...} }` format our server expects — no other changes needed.
+> The backend expects the same `{ "data": {...} }` request shape as the
+> client posts to `/notifyChef` and `/retagExistingMeals`.
 
 ---
 

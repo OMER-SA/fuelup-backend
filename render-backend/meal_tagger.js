@@ -3,8 +3,12 @@
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-async function callGeminiWithRetry(model, prompt, maxRetries = 4) {
-  const delays = [2000, 5000, 15000, 30000];
+async function callGeminiWithRetry(model, prompt, options = {}) {
+  const maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : 3;
+  const baseDelayMs = Number.isFinite(options.baseDelayMs)
+    ? options.baseDelayMs
+    : 5000;
+  const log = options.log || console;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -29,12 +33,12 @@ async function callGeminiWithRetry(model, prompt, maxRetries = 4) {
         throw err;
       }
 
-      const delay = delays[attempt] ?? 30000;
-      console.log(
-        `[meal_tagger] Gemini error on attempt ${attempt + 1}/${maxRetries}: ` +
-        `${msg.substring(0, 80)}. Retrying in ${delay / 1000}s...`
+      const delay = Math.min(baseDelayMs * (2 ** attempt), 30000);
+      log.warn(
+        `[meal_tagger] Gemini error on attempt ${attempt + 1}/${maxRetries + 1}: ` +
+        `${msg.substring(0, 120)}. Retrying in ${Math.round(delay / 1000)}s...`
       );
-      await new Promise(r => setTimeout(r, delay));
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
 }
@@ -171,7 +175,14 @@ FIELD RULES:
 `;
 }
 
-async function tagMealWithGemini({ mealId, mealData, apiKey, admin, log = console }) {
+async function tagMealWithGemini({
+  mealId,
+  mealData,
+  apiKey,
+  admin,
+  log = console,
+  retryOptions = {},
+}) {
   const name = getMealName(mealData);
   const ingredients = extractMealIngredients(mealData);
   const ingredientText = Array.isArray(ingredients)
@@ -190,7 +201,11 @@ async function tagMealWithGemini({ mealId, mealData, apiKey, admin, log = consol
   const prompt = buildMealTagPrompt({ name, ingredientText, calories });
 
   try {
-    const result = await callGeminiWithRetry(model, prompt);
+    const result = await callGeminiWithRetry(model, prompt, {
+      maxRetries: retryOptions.maxRetries,
+      baseDelayMs: retryOptions.baseDelayMs,
+      log,
+    });
     const text = result.response.text().trim();
     const clean = text
       .replace(/^```json\s*/i, "")
