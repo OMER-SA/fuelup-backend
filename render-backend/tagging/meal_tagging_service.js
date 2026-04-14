@@ -6,7 +6,7 @@ const { MEALS_COLLECTION } = require("../meal_tagger");
 
 let singleton = null;
 
-function initializeMealTaggingService({ admin, log = console }) {
+function initializeMealTaggingService({ admin, log = console, freeMode = true }) {
   if (singleton) {
     return singleton;
   }
@@ -27,7 +27,8 @@ function initializeMealTaggingService({ admin, log = console }) {
     maxRetries: 3,
     baseDelayMs: 5000,
     maxRequestsPerMinute: 3,
-    minRuleTagCount: 4,
+    minRuleTagCount: 2,
+    freeMode,
   });
 
   const queue = new MealTaggingQueue({
@@ -90,6 +91,22 @@ function initializeMealTaggingService({ admin, log = console }) {
     forget(mealId) {
       queue.forget(mealId);
       cache.clear(mealId);
+    },
+    /**
+     * EXPLICIT AI ENHANCEMENT (Admin-only)
+     *
+     * Attempts to enhance existing meal tags using Gemini API.
+     * Respects FREE_MODE and quota limits.
+     * NOT triggered automatically.
+     *
+     * Usage:
+     *   taggingService.enhanceMealWithAi(mealId)
+     *
+     * Returns:
+     *   { status: "enhanced|blocked|failed|error", mealId, ... }
+     */
+    async enhanceMealWithAi(mealId) {
+      return worker.enhanceMealWithAi(mealId);
     },
   };
 

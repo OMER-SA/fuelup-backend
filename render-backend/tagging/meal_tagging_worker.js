@@ -62,8 +62,9 @@ class MealTaggingWorker {
     maxRetries = 3,
     baseDelayMs = 5000,
     maxRequestsPerMinute = 3,
-    minRuleTagCount = 4,
+    minRuleTagCount = 2,
     aiAttemptCooldownMs = 6 * 60 * 60 * 1000,
+    freeMode = true,
   }) {
     this.admin = admin;
     this.db = admin.firestore();
@@ -76,6 +77,13 @@ class MealTaggingWorker {
     this.minRuleTagCount = minRuleTagCount;
     this.aiAttemptCooldownMs = aiAttemptCooldownMs;
     this.aiCallTimestamps = [];
+    /**
+     * FREE_MODE = true: NEVER call Gemini, use only rule-based tagging
+     * FREE_MODE = false: AI can be called via explicit enhanceMealWithAi() method (admin trigger only)
+     *
+     * PRIMARY DESIGN: Rule-based tags are 100% reliable. AI is optional, not required.
+     */
+    this.freeMode = freeMode;
   }
 
   async process(job) {
@@ -114,15 +122,11 @@ class MealTaggingWorker {
       }
     }
 
-    // Step 1-4: rule-based tags first, confidence gate
+    // Step 1-3: ALWAYS use rule-based tags (PRIMARY)
     const ruleTags = generateRuleBasedTags(meal);
     const ruleConfidence = scoreRuleConfidence(ruleTags);
-    const strongRuleResult = ruleTags.tags.length >= this.minRuleTagCount;
-    const hasFoodTypeTag = ["snack", "breakfast", "lunch", "dinner"].some(
-      (tag) => Array.isArray(ruleTags.tags) && ruleTags.tags.includes(tag)
-    );
-    const shouldTryAi = !strongRuleResult || !hasFoodTypeTag;
 
+    // Rule-based tags are ALWAYS accepted (minimum 2 tags guarantees quality)
     let finalTagData = {
       ...ruleTags,
       autoTagged: true,
@@ -132,59 +136,11 @@ class MealTaggingWorker {
       autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (shouldTryAi) {
-      const aiDecision = await this._canAttemptAi(meal);
-      if (aiDecision.allowed) {
-        const aiAttemptFields = {
-          autoTagAiAttemptAt: this.admin.firestore.FieldValue.serverTimestamp(),
-          autoTagAiAttempts: this.admin.firestore.FieldValue.increment(1),
-        };
-
-        await this.throttle();
-        this.log.info(`[meal-tagging] AI call starting for ${mealId} (${getMealName(meal)}), reason=${reason}`);
-
-        const aiTagData = await tagMealWithGemini({
-          mealId,
-          mealData: meal,
-          apiKey: process.env.GEMINI_API_KEY,
-          admin: this.admin,
-          log: this.log,
-          retryOptions: {
-            maxRetries: this.maxRetries,
-            baseDelayMs: this.baseDelayMs,
-          },
-        });
-
-        if (aiTagData.autoTagged === true && Array.isArray(aiTagData.tags) && aiTagData.tags.length > 0) {
-          finalTagData = {
-            ...aiTagData,
-            ...aiAttemptFields,
-            autoTagged: true,
-            autoTagModel: "gemini",
-            autoTagError: this.admin.firestore.FieldValue.delete(),
-            autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
-          };
-        } else {
-          this.log.warn(`[meal-tagging] AI failed for ${mealId}. Using fallback rules.`);
-          finalTagData = {
-            ...buildRuleBasedFallback(meal, aiTagData.autoTagError || "ai_failed"),
-            ...aiAttemptFields,
-            autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
-          };
-        }
-      } else {
-        this.log.warn(`[meal-tagging] AI skipped for ${mealId}: ${aiDecision.reason}`);
-        finalTagData = {
-          ...buildRuleBasedFallback(meal, aiDecision.reason),
-          autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
-        };
-      }
-    }
-
-    // Critical guarantee: never persist empty tags
+    // 🔥 CRITICAL GUARANTEE: If rules produce empty tags, force a fallback
     if (!Array.isArray(finalTagData.tags) || finalTagData.tags.length === 0) {
+      this.log.error(`[meal-tagging] EMERGENCY: Rule engine returned empty tags for ${mealId}, forcing fallback`);
       finalTagData = {
-        ...buildRuleBasedFallback(meal, "empty_tags_guard"),
+        ...buildRuleBasedFallback(meal, "rule_engine_empty_guard"),
         autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
       };
     }
@@ -202,6 +158,90 @@ class MealTaggingWorker {
       fallbackUsed: persisted.autoTagModel !== "gemini",
       tags: persisted.tags || [],
     };
+  }
+
+  /**
+   * EXPLICIT AI ENHANCEMENT (Admin-only)
+   *
+   * This method allows MANUAL AI enhancement of already-tagged meals.
+   * It respects FREE_MODE and quota limits.
+   * NOT triggered automatically; only via admin endpoint.
+   *
+   * @param {string} mealId - Meal to enhance
+   * @returns {Promise<{status, source, tags}>}
+   */
+  async enhanceMealWithAi(mealId) {
+    if (this.freeMode) {
+      this.log.warn(
+        `[meal-tagging] AI enhancement request blocked: FREE_MODE=true. Use rule-based tags only.`
+      );
+      return { status: "blocked", reason: "free_mode_enabled", mealId };
+    }
+
+    const ref = this.db.collection(MEALS_COLLECTION).doc(mealId);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      this.log.info(`[meal-tagging] Skip missing meal ${mealId} for AI enhancement`);
+      return { status: "skipped", mealId, reason: "missing-document" };
+    }
+
+    const meal = snap.data();
+
+    // Check quota first
+    const aiDecision = await this._canAttemptAi(meal);
+    if (!aiDecision.allowed) {
+      this.log.warn(`[meal-tagging] AI enhancement blocked for ${mealId}: ${aiDecision.reason}`);
+      return { status: "blocked", mealId, reason: aiDecision.reason };
+    }
+
+    try {
+      await this.throttle();
+      this.log.info(`[meal-tagging] AI enhancement call starting for ${mealId}`);
+
+      const aiTagData = await tagMealWithGemini({
+        mealId,
+        mealData: meal,
+        apiKey: process.env.GEMINI_API_KEY,
+        admin: this.admin,
+        log: this.log,
+        retryOptions: {
+          maxRetries: this.maxRetries,
+          baseDelayMs: this.baseDelayMs,
+        },
+      });
+
+      if (aiTagData.autoTagged === true && Array.isArray(aiTagData.tags) && aiTagData.tags.length > 0) {
+        const enhancedData = {
+          ...aiTagData,
+          autoTagModel: "gemini-enhanced",
+          autoTagError: this.admin.firestore.FieldValue.delete(),
+          autoTagAiEnhanced: true,
+          autoTagAiEnhancedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+          autoTagAiEnhancedAttempts: this.admin.firestore.FieldValue.increment(1),
+        };
+
+        await ref.update(enhancedData);
+        this.cache.set(mealId, meal.autoTagSignature || buildMealSignature(meal), enhancedData);
+
+        return {
+          status: "enhanced",
+          mealId,
+          source: "gemini",
+          tags: enhancedData.tags || [],
+        };
+      } else {
+        this.log.warn(`[meal-tagging] AI enhancement failed for ${mealId}, keeping existing tags`);
+        return {
+          status: "failed",
+          mealId,
+          reason: aiTagData.autoTagError || "ai_failed",
+        };
+      }
+    } catch (error) {
+      this.log.error(`[meal-tagging] AI enhancement error for ${mealId}: ${error.message}`);
+      return { status: "error", mealId, error: error.message };
+    }
   }
 
   async _canAttemptAi(meal) {

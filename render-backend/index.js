@@ -16,7 +16,11 @@ if (!admin.apps.length) {
   });
 }
 
-initializeMealTaggingService({ admin, log: console });
+initializeMealTaggingService({
+  admin,
+  log: console,
+  freeMode: process.env.FREE_MODE !== "false", // true by default (production: FREE_MODE only)
+});
 
 const app = express();
 app.use(express.json());
