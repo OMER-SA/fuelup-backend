@@ -20,53 +20,19 @@ async function retagExistingMealsHandler(request, { HttpsError }) {
       ? Math.floor(requestedBatchSize)
       : 20;
   const forceRetag = request.data?.forceRetag === true;
+  const batchResult = await taggingService.processExistingMeals({
+    batchSize,
+    forceRetag,
+  });
 
-  const snapshot = await db.collection(MEALS_COLLECTION).get();
-  const docsToTag = snapshot.docs
-    .filter((doc) => forceRetag || doc.data().autoTagged !== true)
-    .slice(0, batchSize);
-
-  if (docsToTag.length === 0) {
-    return { tagged: 0, message: "All meals already tagged" };
-  }
-
-  const results = [];
-  let taggedCount = 0;
-  let skippedCount = 0;
-  let failedCount = 0;
-
-  for (const doc of docsToTag) {
-    try {
-      const result = await taggingService.enqueueAndWait({
-        mealId: doc.id,
-        reason: "bulk-retag",
-        priority: 1,
-        force: forceRetag,
-      });
-
-      results.push({
-        id: doc.id,
-        status: result.status,
-        source: result.source || null,
-        fallbackUsed: result.fallbackUsed === true,
-        tags: result.tags || [],
-      });
-
-      if (result.status === "skipped" || result.status === "cached") {
-        skippedCount++;
-      } else if (result.status === "processed") {
-        taggedCount++;
-      }
-    } catch (error) {
-      failedCount++;
-      results.push({
-        id: doc.id,
-        status: "failed",
-        error: error.message,
-      });
-      console.error(`[retagExistingMealsHandler] Error for ${doc.id}:`, error);
-    }
-  }
+  const results = batchResult.results.map((entry) => ({
+    id: entry.id,
+    status: entry.status,
+    source: entry.source || null,
+    fallbackUsed: entry.fallbackUsed === true,
+    tags: entry.tags || [],
+    error: entry.error || null,
+  }));
 
   // Fallback: manually tag known failed meals
   const knownFailed = [
@@ -101,9 +67,9 @@ async function retagExistingMealsHandler(request, { HttpsError }) {
   }
 
   return {
-    tagged: taggedCount,
-    skipped: skippedCount,
-    failed: failedCount,
+    tagged: batchResult.tagged,
+    skipped: batchResult.skipped,
+    failed: batchResult.failed,
     results,
   };
 }

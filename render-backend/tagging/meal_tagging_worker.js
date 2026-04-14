@@ -1,11 +1,16 @@
+const crypto = require("crypto");
 const {
   MEALS_COLLECTION,
   hasMealContent,
   getMealName,
-  getComparableIngredientSignature,
+  extractMealIngredients,
   tagMealWithGemini,
 } = require("../meal_tagger");
-const { buildRuleBasedFallback } = require("./meal_tagging_fallback");
+const {
+  generateRuleBasedTags,
+  scoreRuleConfidence,
+  buildRuleBasedFallback,
+} = require("./meal_tagging_fallback");
 
 function stripDeleteSentinel(value) {
   if (value && typeof value === "object" && value._methodName === "delete") {
@@ -19,7 +24,6 @@ function buildPersistedTagData(tagData, signature) {
   const persisted = {
     ...tagData,
     autoTagSignature: signature,
-    autoTagError: tagData.autoTagged === true ? undefined : tagData.autoTagError,
     autoTagged: true,
   };
 
@@ -36,15 +40,41 @@ function buildPersistedTagData(tagData, signature) {
   return persisted;
 }
 
+function buildMealSignature(meal = {}) {
+  const name = String(meal.mealName || meal.name || meal.title || "").trim().toLowerCase();
+  const ingredients = extractMealIngredients(meal);
+  const ingredientText = Array.isArray(ingredients)
+    ? ingredients.map((item) => String(item).trim().toLowerCase()).sort().join("|")
+    : String(ingredients || "").trim().toLowerCase();
+
+  return crypto
+    .createHash("sha256")
+    .update(`${name}::${ingredientText}`)
+    .digest("hex");
+}
+
 class MealTaggingWorker {
-  constructor({ admin, cache, log = console, maxRetries = 3, baseDelayMs = 5000, maxRequestsPerMinute = 3 }) {
+  constructor({
+    admin,
+    cache,
+    quota,
+    log = console,
+    maxRetries = 3,
+    baseDelayMs = 5000,
+    maxRequestsPerMinute = 3,
+    minRuleTagCount = 4,
+    aiAttemptCooldownMs = 6 * 60 * 60 * 1000,
+  }) {
     this.admin = admin;
     this.db = admin.firestore();
     this.cache = cache;
+    this.quota = quota;
     this.log = log;
     this.maxRetries = maxRetries;
     this.baseDelayMs = baseDelayMs;
     this.maxRequestsPerMinute = maxRequestsPerMinute;
+    this.minRuleTagCount = minRuleTagCount;
+    this.aiAttemptCooldownMs = aiAttemptCooldownMs;
     this.aiCallTimestamps = [];
   }
 
@@ -59,7 +89,7 @@ class MealTaggingWorker {
     }
 
     const meal = snap.data();
-    const signature = getComparableIngredientSignature(meal);
+    const signature = buildMealSignature(meal);
 
     if (!hasMealContent(meal)) {
       this.log.info(`[meal-tagging] Skip ${mealId} (${getMealName(meal)}): no content`);
@@ -73,46 +103,94 @@ class MealTaggingWorker {
         return { status: "cached", mealId, signature };
       }
 
-      if (meal.autoTagged === true && meal.autoTagSignature === signature) {
+      if (
+        meal.autoTagSignature === signature &&
+        Array.isArray(meal.tags) &&
+        meal.tags.length > 0
+      ) {
         this.log.info(`[meal-tagging] Already tagged ${mealId} (${getMealName(meal)}), skipping`);
         this.cache.set(mealId, signature, { autoTagged: true, autoTagSignature: signature });
         return { status: "skipped", mealId, reason: "already-tagged" };
       }
     }
 
-    await this.throttle();
-    this.log.info(`[meal-tagging] AI call starting for ${mealId} (${getMealName(meal)}), reason=${reason}`);
-
-    const tagData = await tagMealWithGemini({
-      mealId,
-      mealData: meal,
-      apiKey: process.env.GEMINI_API_KEY,
-      admin: this.admin,
-      log: this.log,
-      retryOptions: {
-        maxRetries: this.maxRetries,
-        baseDelayMs: this.baseDelayMs,
-      },
-    });
-
-    const persisted = buildPersistedTagData(
-      tagData.autoTagged === true
-        ? tagData
-        : {
-            ...buildRuleBasedFallback(meal, tagData.autoTagError || "Gemini unavailable"),
-            autoTagError: undefined,
-          },
-      signature
+    // Step 1-4: rule-based tags first, confidence gate
+    const ruleTags = generateRuleBasedTags(meal);
+    const ruleConfidence = scoreRuleConfidence(ruleTags);
+    const strongRuleResult = ruleTags.tags.length >= this.minRuleTagCount;
+    const hasFoodTypeTag = ["snack", "breakfast", "lunch", "dinner"].some(
+      (tag) => Array.isArray(ruleTags.tags) && ruleTags.tags.includes(tag)
     );
+    const shouldTryAi = !strongRuleResult || !hasFoodTypeTag;
 
-    if (persisted.autoTagModel === "fallback-rules") {
-      this.log.warn(`[meal-tagging] Fallback used for ${mealId} (${getMealName(meal)})`);
+    let finalTagData = {
+      ...ruleTags,
+      autoTagged: true,
+      autoTagModel: "rule-based",
+      autoTagConfidence: ruleConfidence,
+      autoTagError: this.admin.firestore.FieldValue.delete(),
+      autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (shouldTryAi) {
+      const aiDecision = await this._canAttemptAi(meal);
+      if (aiDecision.allowed) {
+        const aiAttemptFields = {
+          autoTagAiAttemptAt: this.admin.firestore.FieldValue.serverTimestamp(),
+          autoTagAiAttempts: this.admin.firestore.FieldValue.increment(1),
+        };
+
+        await this.throttle();
+        this.log.info(`[meal-tagging] AI call starting for ${mealId} (${getMealName(meal)}), reason=${reason}`);
+
+        const aiTagData = await tagMealWithGemini({
+          mealId,
+          mealData: meal,
+          apiKey: process.env.GEMINI_API_KEY,
+          admin: this.admin,
+          log: this.log,
+          retryOptions: {
+            maxRetries: this.maxRetries,
+            baseDelayMs: this.baseDelayMs,
+          },
+        });
+
+        if (aiTagData.autoTagged === true && Array.isArray(aiTagData.tags) && aiTagData.tags.length > 0) {
+          finalTagData = {
+            ...aiTagData,
+            ...aiAttemptFields,
+            autoTagged: true,
+            autoTagModel: "gemini",
+            autoTagError: this.admin.firestore.FieldValue.delete(),
+            autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+          };
+        } else {
+          this.log.warn(`[meal-tagging] AI failed for ${mealId}. Using fallback rules.`);
+          finalTagData = {
+            ...buildRuleBasedFallback(meal, aiTagData.autoTagError || "ai_failed"),
+            ...aiAttemptFields,
+            autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+          };
+        }
+      } else {
+        this.log.warn(`[meal-tagging] AI skipped for ${mealId}: ${aiDecision.reason}`);
+        finalTagData = {
+          ...buildRuleBasedFallback(meal, aiDecision.reason),
+          autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+        };
+      }
     }
 
-    await ref.update({
-      ...persisted,
-      autoTagError: this.admin.firestore.FieldValue.delete(),
-    });
+    // Critical guarantee: never persist empty tags
+    if (!Array.isArray(finalTagData.tags) || finalTagData.tags.length === 0) {
+      finalTagData = {
+        ...buildRuleBasedFallback(meal, "empty_tags_guard"),
+        autoTaggedAt: this.admin.firestore.FieldValue.serverTimestamp(),
+      };
+    }
+
+    const persisted = buildPersistedTagData(finalTagData, signature);
+    await ref.update(persisted);
 
     this.cache.set(mealId, signature, persisted);
 
@@ -121,9 +199,36 @@ class MealTaggingWorker {
       mealId,
       signature,
       source: persisted.autoTagModel,
-      fallbackUsed: persisted.autoTagModel === "fallback-rules",
+      fallbackUsed: persisted.autoTagModel !== "gemini",
       tags: persisted.tags || [],
     };
+  }
+
+  async _canAttemptAi(meal) {
+    const now = Date.now();
+    const lastAttemptAt = meal.autoTagAiAttemptAt;
+    let lastAttemptMs = 0;
+
+    if (lastAttemptAt && typeof lastAttemptAt.toDate === "function") {
+      lastAttemptMs = lastAttemptAt.toDate().getTime();
+    } else if (typeof lastAttemptAt === "string" || typeof lastAttemptAt === "number") {
+      lastAttemptMs = new Date(lastAttemptAt).getTime();
+    }
+
+    if (lastAttemptMs > 0 && now - lastAttemptMs < this.aiAttemptCooldownMs) {
+      return { allowed: false, reason: "recent_ai_attempt" };
+    }
+
+    if (!this.quota) {
+      return { allowed: false, reason: "quota_not_initialized" };
+    }
+
+    const quotaReservation = await this.quota.reserveSlot();
+    if (!quotaReservation.allowed) {
+      return { allowed: false, reason: "daily_quota_exceeded" };
+    }
+
+    return { allowed: true, reason: "ai_allowed" };
   }
 
   async throttle() {
@@ -143,4 +248,4 @@ class MealTaggingWorker {
   }
 }
 
-module.exports = { MealTaggingWorker };
+module.exports = { MealTaggingWorker, buildMealSignature };

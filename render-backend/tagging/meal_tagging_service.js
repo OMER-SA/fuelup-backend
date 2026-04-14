@@ -1,6 +1,8 @@
 const { MealTagCache } = require("./meal_tagging_cache");
 const { MealTaggingQueue } = require("./meal_tagging_queue");
 const { MealTaggingWorker } = require("./meal_tagging_worker");
+const { DailyAiQuota } = require("./meal_tagging_quota");
+const { MEALS_COLLECTION } = require("../meal_tagger");
 
 let singleton = null;
 
@@ -10,13 +12,22 @@ function initializeMealTaggingService({ admin, log = console }) {
   }
 
   const cache = new MealTagCache();
+  const db = admin.firestore();
+  const quota = new DailyAiQuota({
+    db,
+    log,
+    maxPerDay: 18,
+  });
+
   const worker = new MealTaggingWorker({
     admin,
     cache,
+    quota,
     log,
     maxRetries: 3,
     baseDelayMs: 5000,
     maxRequestsPerMinute: 3,
+    minRuleTagCount: 4,
   });
 
   const queue = new MealTaggingQueue({
@@ -37,6 +48,44 @@ function initializeMealTaggingService({ admin, log = console }) {
     },
     enqueueAndWait(job) {
       return queue.enqueue({ ...job, debounceMs: 0 });
+    },
+    async processExistingMeals({ batchSize = 50, forceRetag = false } = {}) {
+      const snapshot = await db.collection(MEALS_COLLECTION).get();
+      const docsToTag = snapshot.docs
+        .filter((doc) => forceRetag || !Array.isArray(doc.data().tags) || doc.data().tags.length === 0)
+        .slice(0, batchSize);
+
+      let tagged = 0;
+      let skipped = 0;
+      let failed = 0;
+      const results = [];
+
+      for (const doc of docsToTag) {
+        try {
+          const result = await queue.enqueue({
+            mealId: doc.id,
+            reason: "process-existing",
+            priority: 1,
+            force: forceRetag,
+            debounceMs: 0,
+          });
+
+          results.push({ id: doc.id, ...result });
+          if (result.status === "processed") tagged++;
+          else skipped++;
+        } catch (error) {
+          failed++;
+          results.push({ id: doc.id, status: "failed", error: error.message });
+        }
+      }
+
+      return {
+        tagged,
+        skipped,
+        failed,
+        considered: docsToTag.length,
+        results,
+      };
     },
     forget(mealId) {
       queue.forget(mealId);

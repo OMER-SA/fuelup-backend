@@ -1,154 +1,131 @@
-const FALLBACK_TAG_KEYWORDS = [
-  { terms: ["fried", "fry", "crispy", "samosa", "pakora"], tags: ["fried", "heavy", "fatty"] },
-  { terms: ["salad", "greens", "spinach", "lettuce", "fresh"], tags: ["fresh", "light", "greens", "balanced"] },
-  { terms: ["soup", "broth", "steamed", "boiled"], tags: ["light", "calming"] },
-  { terms: ["spicy", "chili", "chilli", "pepper", "hot"], tags: ["spicy", "energizing"] },
-  { terms: ["grilled", "roasted", "bbq"], tags: ["protein", "balanced"] },
-  { terms: ["bread", "rice", "noodle", "pasta", "naan", "roti", "wrap"], tags: ["complex_carb", "whole_grain"] },
-  { terms: ["sweet", "dessert", "cake", "syrup", "sugar"], tags: ["refined_sugar", "heavy", "comfort"] },
-  { terms: ["butter", "cream", "cheese", "ghee", "mayo"], tags: ["fatty", "rich", "heavy"] },
-];
+const ANIMAL_TERMS = ["chicken", "beef", "mutton", "lamb", "fish", "shrimp", "prawn", "egg"];
+const HALAL_UNSAFE_TERMS = ["pork", "ham", "bacon", "wine", "alcohol", "rum"];
 
-const ALLERGEN_KEYWORDS = {
-  gluten: ["wheat", "flour", "bread", "naan", "roti", "pasta", "bun", "samosa"],
+const ALLERGEN_RULES = {
+  gluten: ["wheat", "flour", "bread", "naan", "roti", "pasta", "bun", "noodle", "samosa"],
   dairy: ["milk", "cheese", "butter", "cream", "yogurt", "paneer", "ghee"],
-  eggs: ["egg", "mayonnaise", "mayo"],
+  oil: ["oil", "fried", "deep fried", "frying"],
   nuts: ["almond", "cashew", "peanut", "pistachio", "walnut", "nut"],
-  soy: ["soy", "tofu", "soya"],
-  shellfish: ["shrimp", "prawn", "crab", "lobster", "shellfish"],
-  fish: ["fish", "salmon", "tuna", "anchovy"],
-  wheat: ["wheat", "flour", "bread", "naan", "roti", "pasta", "bun"],
-  sesame: ["sesame", "tahini", "benniseed"],
-  sulphites: ["wine", "vinegar", "dried fruit", "preserved"],
 };
-
-function normalizeText(mealData = {}) {
-  const parts = [mealData.mealName, mealData.name, mealData.title];
-  const ingredients = Array.isArray(mealData.recipie)
-    ? mealData.recipie
-        .map((item) => {
-          if (!item) return "";
-          if (typeof item === "string") return item;
-          if (typeof item === "object") return item.ingredient || "";
-          return "";
-        })
-        .join(" ")
-    : [mealData.ingredients, mealData.ingredientsList, mealData.ingredient_list]
-        .filter(Boolean)
-        .join(" ");
-
-  parts.push(ingredients);
-  return parts.join(" ").toLowerCase();
-}
 
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
-function estimateProtein(text) {
-  const proteinMatches = [
-    ["chicken", 28],
-    ["beef", 26],
-    ["mutton", 25],
-    ["lamb", 25],
-    ["fish", 24],
-    ["salmon", 24],
-    ["tuna", 24],
-    ["egg", 12],
-    ["paneer", 14],
-    ["tofu", 12],
-    ["lentil", 10],
-    ["beans", 9],
-    ["chickpea", 9],
-    ["yogurt", 8],
-    ["milk", 7],
-    ["samosa", 8],
-  ];
-
-  for (const [term, protein] of proteinMatches) {
-    if (text.includes(term)) {
-      return protein;
-    }
+function toIngredientText(recipie) {
+  if (!Array.isArray(recipie)) {
+    return "";
   }
 
+  return recipie
+    .map((item) => {
+      if (!item) return "";
+      if (typeof item === "string") return item;
+      if (typeof item === "object") return item.ingredient || "";
+      return "";
+    })
+    .join(" ");
+}
+
+function normalizeMealText(mealData = {}) {
+  const name = mealData.mealName || mealData.name || mealData.title || "";
+  const description = mealData.description || "";
+  const category = mealData.category || "";
+  const ingredients = toIngredientText(mealData.recipie);
+
+  return `${name} ${description} ${category} ${ingredients}`.toLowerCase();
+}
+
+function includesAny(text, terms) {
+  return terms.some((term) => text.includes(term));
+}
+
+function estimateProtein(text) {
+  if (includesAny(text, ["chicken", "beef", "mutton", "lamb"])) return 24;
+  if (includesAny(text, ["fish", "salmon", "tuna", "prawn", "shrimp"])) return 20;
+  if (includesAny(text, ["paneer", "tofu", "egg"])) return 14;
+  if (includesAny(text, ["lentil", "beans", "chickpea", "peas"])) return 10;
   return 6;
 }
 
-function determinePrepStyle(text) {
-  if (text.includes("fried") || text.includes("samosa") || text.includes("pakora")) {
-    return "fried";
-  }
-
-  if (text.includes("grilled") || text.includes("bbq") || text.includes("roasted")) {
-    return "grilled";
-  }
-
-  if (text.includes("steamed")) {
-    return "steamed";
-  }
-
-  if (text.includes("boiled") || text.includes("soup") || text.includes("broth")) {
-    return "boiled";
-  }
-
-  if (text.includes("raw") || text.includes("salad")) {
-    return "raw";
-  }
-
-  if (text.includes("baked") || text.includes("cake") || text.includes("bread")) {
-    return "baked";
-  }
-
+function inferPrepStyle(text) {
+  if (includesAny(text, ["fried", "fry", "deep fried", "samosa", "pakora"])) return "fried";
+  if (includesAny(text, ["baked", "oven", "roasted"])) return "baked";
+  if (includesAny(text, ["boiled", "soup", "broth"])) return "boiled";
+  if (includesAny(text, ["grilled", "bbq"])) return "grilled";
+  if (includesAny(text, ["steamed"])) return "steamed";
   return "mixed";
 }
 
-function buildRuleBasedFallback(mealData = {}, reason = "Gemini unavailable") {
-  const text = normalizeText(mealData);
+function generateRuleBasedTags(mealData = {}) {
+  const text = normalizeMealText(mealData);
+  const calories = Number(mealData.calories || mealData.calorie || 0);
+  const category = String(mealData.category || "").toLowerCase();
+
   const tags = [];
-
-  for (const rule of FALLBACK_TAG_KEYWORDS) {
-    if (rule.terms.some((term) => text.includes(term))) {
-      tags.push(...rule.tags);
-    }
-  }
-
-  if (text.includes("chicken") || text.includes("fish") || text.includes("paneer") || text.includes("tofu") || text.includes("egg")) {
-    tags.push("protein", "balanced");
-  }
-
-  if (text.includes("salad") || text.includes("vegetable") || text.includes("spinach") || text.includes("greens")) {
-    tags.push("fresh", "greens", "light");
-  }
-
-  if (!tags.length) {
-    tags.push("balanced", "light");
-  }
-
   const allergens = [];
-  for (const [allergen, terms] of Object.entries(ALLERGEN_KEYWORDS)) {
-    if (terms.some((term) => text.includes(term))) {
+  const dietaryLabels = [];
+
+  // 1) Food type
+  if (includesAny(text, ["snack", "samosa", "chips", "fries"]) || category.includes("snack")) tags.push("snack");
+  if (includesAny(text, ["breakfast", "omelette", "paratha"]) || category.includes("breakfast")) tags.push("breakfast");
+  if (includesAny(text, ["lunch", "thali"]) || category.includes("lunch")) tags.push("lunch");
+  if (includesAny(text, ["dinner", "supper"]) || category.includes("dinner")) tags.push("dinner");
+
+  // 2) Health type + cooking method
+  const prepStyle = inferPrepStyle(text);
+  if (prepStyle === "fried") {
+    tags.push("fried", "unhealthy", "fat_rich", "comfort_food", "heavy");
+  } else if (prepStyle === "baked" || prepStyle === "boiled" || prepStyle === "steamed" || prepStyle === "grilled") {
+    tags.push("healthy");
+  }
+
+  // 3) Mood tags
+  if (includesAny(text, ["soup", "warm", "khichdi", "samosa", "comfort"])) tags.push("comfort_food", "stress_relief");
+  if (includesAny(text, ["coffee", "tea", "spicy", "chili", "pepper"])) tags.push("energetic");
+  if (includesAny(text, ["salad", "fruit", "light", "steamed"])) tags.push("light");
+  if (includesAny(text, ["fried", "cream", "butter", "cheese", "heavy"]) || calories > 400) tags.push("heavy");
+
+  // 4) Nutritional tags
+  if (includesAny(text, ["chicken", "beef", "mutton", "fish", "paneer", "tofu", "egg", "lentil", "beans", "chickpea"])) {
+    tags.push("protein");
+  }
+  if (includesAny(text, ["rice", "potato", "bread", "flour", "naan", "roti", "pasta", "noodle", "peas"])) {
+    tags.push("carbs");
+  }
+  if (includesAny(text, ["oil", "butter", "cream", "ghee", "fried", "fat"])) {
+    tags.push("fat_rich");
+  }
+  if (calories > 0 && calories <= 250) tags.push("low_calorie", "light");
+  if (calories >= 400) tags.push("high_calorie", "heavy");
+
+  // 5) Dietary tags
+  const containsAnimal = includesAny(text, ANIMAL_TERMS);
+  const containsDairy = includesAny(text, ALLERGEN_RULES.dairy);
+  if (!containsAnimal || (containsAnimal && !includesAny(text, ["chicken", "beef", "mutton", "lamb", "fish", "shrimp", "prawn"])) ) {
+    dietaryLabels.push("vegetarian");
+  }
+  if (!containsAnimal && !containsDairy) {
+    dietaryLabels.push("vegan");
+  }
+  if (!includesAny(text, HALAL_UNSAFE_TERMS)) {
+    dietaryLabels.push("halal");
+  }
+
+  // 6) Allergens
+  for (const [allergen, terms] of Object.entries(ALLERGEN_RULES)) {
+    if (includesAny(text, terms)) {
       allergens.push(allergen);
     }
   }
 
-  const dietaryLabels = [];
-  if (!text.includes("chicken") && !text.includes("fish") && !text.includes("beef") && !text.includes("mutton") && !text.includes("egg")) {
-    dietaryLabels.push("vegetarian");
+  // 7) Balanced fallback
+  if (!tags.includes("healthy") && !tags.includes("unhealthy")) {
+    tags.push("balanced");
   }
 
-  if (
-    !text.includes("milk") &&
-    !text.includes("cheese") &&
-    !text.includes("butter") &&
-    !text.includes("cream") &&
-    !text.includes("paneer") &&
-    !text.includes("yogurt")
-  ) {
-    dietaryLabels.push("dairy_free");
-  }
-
-  if (!allergens.includes("gluten") && !text.includes("bread") && !text.includes("flour") && !text.includes("naan") && !text.includes("roti")) {
-    dietaryLabels.push("gluten_free");
+  if (!tags.length) {
+    tags.push("balanced", "light");
   }
 
   return {
@@ -156,11 +133,31 @@ function buildRuleBasedFallback(mealData = {}, reason = "Gemini unavailable") {
     allergens: unique(allergens),
     dietaryLabels: unique(dietaryLabels),
     protein: estimateProtein(text),
-    prepStyle: determinePrepStyle(text),
-    autoTagged: true,
-    autoTagModel: "fallback-rules",
-    autoTagFallbackReason: reason,
+    prepStyle,
   };
 }
 
-module.exports = { buildRuleBasedFallback };
+function scoreRuleConfidence(tagData = {}) {
+  const tagCount = Array.isArray(tagData.tags) ? tagData.tags.length : 0;
+  const dietCount = Array.isArray(tagData.dietaryLabels) ? tagData.dietaryLabels.length : 0;
+  const allergenCount = Array.isArray(tagData.allergens) ? tagData.allergens.length : 0;
+  return tagCount + dietCount + allergenCount;
+}
+
+function buildRuleBasedFallback(mealData = {}, reason = "Gemini unavailable") {
+  const ruleTags = generateRuleBasedTags(mealData);
+  return {
+    ...ruleTags,
+    autoTagged: true,
+    autoTagModel: "rule-based",
+    autoTagError: "fallback_used",
+    autoTagFallbackReason: reason,
+    autoTagConfidence: scoreRuleConfidence(ruleTags),
+  };
+}
+
+module.exports = {
+  generateRuleBasedTags,
+  scoreRuleConfidence,
+  buildRuleBasedFallback,
+};
