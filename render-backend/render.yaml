@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fuelup-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false          # paste manually in Render dashboard
+      - key: FIREBASE_DATABASE_URL
+        sync: false          # e.g. https://fuelup-2e090-default-rtdb.firebaseio.com
+      - key: GEMINI_API_KEY
+        sync: false          # your Gemini API key
